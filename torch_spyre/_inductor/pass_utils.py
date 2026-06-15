@@ -40,8 +40,13 @@ from .codegen.superdsc import (
     _k_fast_core_to_slice_mapping,
     _should_use_k_fast_mapping,
 )
-from .constants import BATCH_MATMUL_OP, ELIDED_COPY_BACK_ATTR
-from .ir import FixedTiledLayout, SpyreConstantFallback
+from .constants import (
+    AVGPOOL_FWD_OP,
+    AVGPOOL_NMAP_OP,
+    BATCH_MATMUL_OP,
+    ELIDED_COPY_BACK_ATTR,
+)
+from .ir import FixedTiledLayout, SpyreConstantFallback, SpyreReduction
 from .logging_utils import get_inductor_logger
 from .views import compute_coordinates, matching_dim
 
@@ -195,11 +200,38 @@ def iter_var_id(stick_expr) -> int:
     return int(name[i + 1 :])
 
 
+def _has_implicit_kernel_dims(data) -> bool:
+    """True for reductions whose kernel dims (kH, kW) are absent from the input shape.
+
+    For avgpool the inner_fn indexes input as input[n, c, oh*sH+kh, ow*sW+kw],
+    folding kH/kW into the H/W range rather than exposing them as standalone
+    input dimensions.  Inductor's reads.ranges therefore contains {N,C,H,W} with
+    no separate kH or kW entry.  We must append them explicitly as r0, r1 symbols
+    so that the SDSC and work-division passes see the full iteration space.
+
+    Other reductions (exx2, mean, batchmatmul) already capture their reduction
+    dim inside reads.ranges and require no change.
+    """
+    return (
+        isinstance(data, SpyreReduction)
+        and data.reduction_type in (AVGPOOL_FWD_OP, AVGPOOL_NMAP_OP)
+    )
+
+
 def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
     if isinstance(n.node.data, Pointwise):
         # The iteration space of a Pointwise is that of its output
         return next(iter(n.read_writes.writes)).ranges.copy()
     elif isinstance(n.node.data, Reduction):
+        if _has_implicit_kernel_dims(n.node.data):
+            # Output ranges + explicit reduction symbols r0, r1, ...
+            # kH and kW are absent from the input tensor shape (sliding window)
+            out_ranges = next(iter(n.read_writes.writes)).ranges.copy()
+            red_syms = {
+                sympy.Symbol(f"r{i}"): size
+                for i, size in enumerate(n.node.data.reduction_ranges)
+            }
+            return {**out_ranges, **red_syms}
         # The iteration space of a Reduction is that of its input
         return next(iter(n.read_writes.reads)).ranges.copy()
     else:
@@ -213,6 +245,13 @@ def iteration_space_from_op(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr
     if isinstance(op.data, Pointwise):
         return next(iter(rw.writes)).ranges.copy()
     elif isinstance(op.data, Reduction):
+        if _has_implicit_kernel_dims(op.data):
+            out_ranges = next(iter(rw.writes)).ranges.copy()
+            red_syms = {
+                sympy.Symbol(f"r{i}"): size
+                for i, size in enumerate(op.data.reduction_ranges)
+            }
+            return {**out_ranges, **red_syms}
         return next(iter(rw.reads)).ranges.copy()
     else:
         raise Unsupported("Unexpected node type")
