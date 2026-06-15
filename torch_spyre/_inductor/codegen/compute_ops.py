@@ -16,6 +16,7 @@
 import dataclasses
 
 from torch_spyre._C import encode_constant, DataFormats
+from torch_spyre._inductor.constants import AVGPOOL_FWD_OP, AVGPOOL_NMAP_OP
 from sympy import Symbol
 
 
@@ -134,18 +135,31 @@ def gen_coord_info_value(
     elems_per_stick: int,
     is_stick_dim: bool,
     is_stick_reduction: bool = False,
+    pool_params: dict | None = None,
 ):
+    pad_type = pool_params["pad_type"] if pool_params else "nopad"
+    if pool_params:
+        # For avgpool input spatial dims: alpha_ is the per-core input step (size * stride),
+        # elem_arr_0 is the per-core input window (alpha_ + kernel - 1, clamped to totalSize).
+        alpha_val = size * pool_params["stride"]
+        elem_arr_0_val = min(
+            alpha_val + pool_params["window_size"] - 1, pool_params["total_size"]
+        )
+    else:
+        alpha_val = size
+        elem_arr_0_val = size
+
     return (
         {
             "spatial": 3,
             "temporal": 0,
             "elemArr": 1,
-            "padding": "nopad",
+            "padding": pad_type,
             "folds": {
                 "dim_prop_func": [
                     {
                         "Affine": {
-                            "alpha_": size,
+                            "alpha_": alpha_val,
                             "beta_": 0,
                         }
                     },
@@ -182,7 +196,7 @@ def gen_coord_info_value(
                         "label_": "row_fold",
                     },
                     {
-                        "factor_": size,
+                        "factor_": elem_arr_0_val,
                         "label_": "elem_arr_0",
                     },
                 ],
@@ -193,7 +207,7 @@ def gen_coord_info_value(
             "spatial": 3,
             "temporal": 0,
             "elemArr": 2,
-            "padding": "nopad",
+            "padding": pad_type,
             "folds": {
                 "dim_prop_func": [
                     {
@@ -254,6 +268,67 @@ def gen_coord_info_value(
             },
         }
     )
+
+
+def get_avgpool_params(
+    tensor_idx: int,
+    dim_sym: Symbol,
+    pool_params: dict,
+) -> "dict | None":
+    """Return per-dim pool_params for gen_coord_info_value; only input tensor spatial dims."""
+    if not pool_params:
+        return None
+    if tensor_idx != 0:
+        return None
+    dim_str = str(dim_sym)
+    pad_dim_i = pool_params.get("pad_dim_i", "i")
+    pad_dim_j = pool_params.get("pad_dim_j", "j")
+    if dim_str == pad_dim_i:
+        return {
+            "pad_type": pool_params["pad_type_h"],
+            "total_size": pool_params["total_size_h"],
+            "window_size": pool_params.get("window_size_h", 1),
+            "stride": pool_params["stride_h"],
+        }
+    if dim_str == pad_dim_j:
+        return {
+            "pad_type": pool_params["pad_type_w"],
+            "total_size": pool_params["total_size_w"],
+            "window_size": pool_params.get("window_size_w", 1),
+            "stride": pool_params["stride_w"],
+        }
+    return None
+
+
+def _make_avgpool_padding_sizes(sdsc_spec) -> dict:
+    """Build paddingSizes_ dict for the N_ entry in an avgpool DSC."""
+    pp = sdsc_spec.pool_params
+    if not pp:
+        return {}
+    result = {}
+    for dim_str, suffix in [
+        (pp.get("pad_dim_i", "i"), "h"),
+        (pp.get("pad_dim_j", "j"), "w"),
+    ]:
+        pad = pp[f"pad_{suffix}"]
+        total_size = pp[f"total_size_{suffix}"]
+        stride = pp[f"stride_{suffix}"]
+        window_size = pp.get(f"window_size_{suffix}", 1)
+        window_dim = pp.get(f"window_dim_k{dim_str}", f"k{dim_str}")
+        h_out = sdsc_spec.iteration_space.get(Symbol(dim_str), 1)
+        unneeded_pad = max(0, total_size - ((h_out - 1) * stride + window_size))
+        result[dim_str] = {
+            "padFront_": pad,
+            "padBack_": pad,
+            "unneededPad_": unneeded_pad,
+            "unneededPadFront_": 0,
+            "unneededPadBack_": 0,
+            "totalSize_": total_size,
+            "stride_": stride,
+            "dilation_": 1,
+            "windowDim_": window_dim,
+        }
+    return result
 
 
 def _tiled_byte_stride(tensor, tiled_sym, iteration_space) -> int:
@@ -471,6 +546,15 @@ def generate_sdsc(
                                     str(dim) + "_": size
                                     for dim, size in sdsc_spec.iteration_space.items()
                                 },
+                                **(
+                                    {
+                                        "paddingSizes_": _make_avgpool_padding_sizes(
+                                            sdsc_spec
+                                        )
+                                    }
+                                    if sdsc_spec.pool_params
+                                    else {}
+                                ),
                             },
                             "coordinateMasking_": {
                                 str(dim): mask_range
@@ -523,6 +607,22 @@ def generate_sdsc(
                                     **(
                                         {"isStartAddrSymbolic_": 1}
                                         if use_symbols and "lx" not in tensor.allocation
+                                        else {}
+                                    ),
+                                    **(
+                                        {
+                                            "padding_": {
+                                                sdsc_spec.pool_params.get(
+                                                    "pad_dim_i", "i"
+                                                ): sdsc_spec.pool_params["pad_type_h"],
+                                                sdsc_spec.pool_params.get(
+                                                    "pad_dim_j", "j"
+                                                ): sdsc_spec.pool_params["pad_type_w"],
+                                            }
+                                        }
+                                        if sdsc_spec.pool_params and i == 0
+                                        else {"padding_": {}}
+                                        if sdsc_spec.pool_params
                                         else {}
                                     ),
                                     "layoutDimOrder_": [
@@ -589,6 +689,11 @@ def generate_sdsc(
                                                 ),
                                                 is_stick_reduction=(
                                                     tensor.scales[dim] == -2
+                                                ),
+                                                pool_params=get_avgpool_params(
+                                                    i,
+                                                    dim,
+                                                    sdsc_spec.pool_params,
                                                 ),
                                             )
                                             for dim in sdsc_spec.layouts[tensor.layout][
