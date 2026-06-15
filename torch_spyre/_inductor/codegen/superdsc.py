@@ -21,6 +21,10 @@ from sympy import Integer, Symbol, Expr, Mod, floor
 from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.constants import (
+    AVGPOOL_DIM_LABELS,
+    AVGPOOL_FWD_OP,
+    AVGPOOL_LAYOUT_LABELS,
+    AVGPOOL_NMAP_OP,
     IDENTITY_OP,
     INPUT_DIM_LABELS,
     OUTPUT_DIM_LABELS,
@@ -91,6 +95,7 @@ class SDSCSpec:
     args: list[SDSCArgs]
     constants: dict[str, Any]
     coordinate_masking: dict[Symbol, Any]
+    pool_params: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def __str__(self) -> str:
         iter_space = ", ".join(f"{k}={v}" for k, v in self.iteration_space.items())
@@ -292,9 +297,15 @@ def _is_topk(op: str) -> bool:
     return op in TOPK_OPS
 
 
-def _get_op_dim_labels(ndim: int, is_matmul: bool) -> list[str]:
+def _is_avgpool(op: str) -> bool:
+    return op in (AVGPOOL_FWD_OP, AVGPOOL_NMAP_OP)
+
+
+def _get_op_dim_labels(ndim: int, is_matmul: bool, is_avgpool: bool = False) -> list[str]:
     if is_matmul:
         return MATMUL_DIM_LABELS[len(MATMUL_DIM_LABELS) - ndim :]
+    elif is_avgpool:
+        return AVGPOOL_DIM_LABELS[len(AVGPOOL_DIM_LABELS) - ndim :]
     else:
         return INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
 
@@ -326,7 +337,7 @@ def _create_sdsc_tensors(
 ) -> tuple[list[SDSCArgs], dict, Symbol | None]:
     dims = list(iteration_space.keys())
     layouts: dict = {}
-    use_op_dims = not _is_matmul(op_spec.op)
+    use_op_dims = not _is_matmul(op_spec.op) and not _is_avgpool(op_spec.op)
 
     missing_dim = None
     sdsc_args: list[SDSCArgs] = []
@@ -380,12 +391,18 @@ def _create_sdsc_tensors(
             max_dim_sizes[dim] = -1
 
         effective_stick = op_stick_dim if stick_dim is None else stick_dim
+        if not use_op_dims and _is_matmul(op_spec.op):
+            layout_label_list = MATMUL_LAYOUT_LABELS
+        elif _is_avgpool(op_spec.op):
+            layout_label_list = AVGPOOL_LAYOUT_LABELS
+        else:
+            layout_label_list = LAYOUT_LABELS
         label = _get_layout_label(
             layouts,
             dim_order,
             effective_stick,
             arg.device_dtype.elems_per_stick(),
-            MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS,
+            layout_label_list,
         )
         # Change dataFormat_ value if needed.
         # This is a temporary workaround until the backend supports IEEE_INT32 in SDSC (deeptools issue #4307).
@@ -419,6 +436,7 @@ def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
         is_reduction
         and not _is_matmul(op)
         and not _is_topk(op)
+        and not _is_avgpool(op)
         and -2 not in output_scales.values()
     ):
         return op + "nonstick"
@@ -530,9 +548,10 @@ def _extend_matmul_k_to_padded(
 
 def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
+    is_avgpool_op = _is_avgpool(op_spec.op)
     ndim = len(op_spec.iteration_space)
 
-    dim_labels = _get_op_dim_labels(ndim, is_matmul)
+    dim_labels = _get_op_dim_labels(ndim, is_matmul, is_avgpool_op)
     symbol_mapping = {
         sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space)
     }
@@ -559,11 +578,22 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     ref_arg = _ref_arg(op_spec)
     op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
 
-    if op_stick_dim is None:
+    if op_stick_dim is None and not is_avgpool_op:
         stick_sym = Symbol(INPUT_DIM_LABELS[ndim])
         sdsc_iteration_space[stick_sym] = op_spec.args[0].device_dtype.elems_per_stick()
         work_slices[stick_sym] = 1
         dim_splits[stick_sym] = 1
+
+    if is_avgpool_op:
+        # When N=1 or C fits in one stick (<=64 elems), Inductor squeezes "mb" and/or
+        # "out" to size-1 constants, dropping them from the iteration space.
+        # avgpoolfwd/avgpoolnmapfwd require all dims present; inject them as size-1.
+        # "out" must come before "mb" so _create_sdsc_tensors picks "out" as stick_dim.
+        for squeeze_sym in (Symbol("out"), Symbol("mb")):
+            if squeeze_sym not in sdsc_iteration_space:
+                sdsc_iteration_space[squeeze_sym] = 1
+                work_slices[squeeze_sym] = 1
+                dim_splits[squeeze_sym] = 1
 
     if is_matmul:
         _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
@@ -614,6 +644,9 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     if _is_topk(op_spec.op):
         num_inputs = 1  # topk has exactly 1 input tensor and 1 output tensor
 
+    if is_avgpool_op:
+        num_inputs = 1  # avgpool has 1 input tensor and 1 output tensor
+
     if _should_use_k_fast_mapping(is_matmul, sdsc_iteration_space, dim_splits):
         core_id_to_work_slice = _k_fast_core_to_slice_mapping(
             sdsc_iteration_space, dim_splits, num_cores
@@ -640,6 +673,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             args=args,
             constants=constants,
             coordinate_masking=coordinate_masking,
+            pool_params=op_spec.op_info.get("pool_params", {}) if op_spec.op_info else {},
         ),
         symbol_mapping,
     )
