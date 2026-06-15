@@ -78,9 +78,17 @@ TOPK_OPS = {"topkvalue", "topkindex"}
 
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
+AVGPOOL_LAYOUT_LABELS = ["OUTPUT", "INPUT"]
 
 
 # Populate more valid labels from deeptools here if needed
 INPUT_DIM_LABELS = ["mb", "x", "y", "i", "j", "ki", "kj"]
 OUTPUT_DIM_LABELS = ["out"]
 MATMUL_DIM_LABELS = ["ki", "kj", "y", "x", "mb", "out", "in"]
+
+# Avgpool opfunc names (deeptools dsc/dscdefn.cpp)
+AVGPOOL_FWD_OP = "avgpoolfwd"      # uniform divisor, zero padding only
+AVGPOOL_NMAP_OP = "avgpoolnmapfwd" # per-output divisor map, non-zero padding
+
+# Iteration space order: [mb?, C, oH, oW, kH?, kW?] — NCHW; tail-slice for ndim < 6
+AVGPOOL_DIM_LABELS = ["mb", "out", "i", "j", "ki", "kj"]
