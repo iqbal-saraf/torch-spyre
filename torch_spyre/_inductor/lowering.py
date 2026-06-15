@@ -23,7 +23,13 @@ import torch._inductor.lowering as lowering
 import torch._inductor.ir as ir
 from typing import Any, Callable, Union
 
-from .constants import BATCH_MATMUL_OP, COPY_BACK_CANDIDATE_ATTR, BATCH_MATMUL_FP8_OP
+from .constants import (
+    AVGPOOL_FWD_OP,
+    AVGPOOL_NMAP_OP,
+    BATCH_MATMUL_OP,
+    COPY_BACK_CANDIDATE_ATTR,
+    BATCH_MATMUL_FP8_OP,
+)
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
 from .ir import SpyreReduction, SpyreConstantFallback, SpyreEmptyFallback
@@ -655,6 +661,81 @@ def lower_mean(x, axis=None, keepdim=False, *, dtype=None):
 def lower_mean_default(x, *, dtype=None):
     axis = list(range(len(x.get_size())))
     return lower_mean(x, axis=axis, keepdim=False, dtype=dtype)
+
+
+@register_spyre_lowering(torch.ops.aten.avg_pool2d.default)
+def lower_avg_pool2d(
+    x,
+    kernel_size,
+    stride=None,
+    padding=0,
+    ceil_mode=False,
+    count_include_pad=True,
+    divisor_override=None,
+):
+    if ceil_mode:
+        raise Unsupported("avg_pool2d: ceil_mode=True not supported")
+    if divisor_override is not None:
+        raise Unsupported("avg_pool2d: divisor_override not supported")
+
+    kH, kW = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+    sH, sW = (
+        (kH, kW)
+        if stride is None
+        else ((stride, stride) if isinstance(stride, int) else tuple(stride))
+    )
+    pH, pW = (padding, padding) if isinstance(padding, int) else tuple(padding)
+
+    x_size = x.get_size()
+    N, C, H, W = x_size[0], x_size[1], x_size[2], x_size[3]
+    H_out = (H + 2 * pH - kH) // sH + 1
+    W_out = (W + 2 * pW - kW) // sW + 1
+
+    opfunc = AVGPOOL_NMAP_OP if (pH > 0 or pW > 0) else AVGPOOL_FWD_OP
+
+    op_info: dict = {
+        "pool_params": {
+            "stride_h": sH,
+            "stride_w": sW,
+            "pad_h": pH,
+            "pad_w": pW,
+            "dilation_h": 1,
+            "dilation_w": 1,
+            "total_size_h": H + 2 * pH,
+            "total_size_w": W + 2 * pW,
+            "window_size_h": int(kH),
+            "window_size_w": int(kW),
+            "pad_dim_i": "i",
+            "pad_dim_j": "j",
+            "window_dim_ki": "ki",
+            "window_dim_kj": "kj",
+            "pad_type_h": "padded_fullspan_wunneeded" if pH == 0 else "padded_nozeropad",
+            "pad_type_w": "padded_fullspan_wunneeded" if pW == 0 else "padded_nozeropad",
+        }
+    }
+    if opfunc == AVGPOOL_FWD_OP:
+        op_info["constants"] = {"nmap": 1.0 / (int(kH) * int(kW))}
+
+    input_loader = x.make_loader()
+
+    def inner_fn(index, rindex):
+        n, c, oh, ow = index
+        kh, kw = rindex
+        return input_loader([n, c, oh * sH + kh, ow * sW + kw])
+
+    result = SpyreReduction.create(
+        reduction_type=opfunc,
+        input_node=x,
+        device=x.get_device(),
+        dst_dtype=x.get_dtype(),
+        src_dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=[N, C, H_out, W_out],
+        reduction_ranges=[kH, kW],
+        op_info=op_info,
+    )
+    result.realize()
+    return result
 
 
 @register_spyre_lowering(torch.ops.spyre.gelu)
