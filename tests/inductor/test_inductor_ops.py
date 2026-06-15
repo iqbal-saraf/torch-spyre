@@ -3782,6 +3782,34 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
         },
+        ("test_avg_pool2d", "test_avg_pool2d_cpu"): {
+            "param_sets": {
+                "1x64x6_k2_s2_nopad": (
+                    cached_randn((1, 64, 6, 6)),
+                    2,
+                    2,
+                    0,
+                ),
+                "1x64x42_k3_s3_nopad": (
+                    cached_randn((1, 64, 42, 42)),
+                    3,
+                    3,
+                    0,
+                ),
+                "1x64x16_k3_s1_pad1": (
+                    cached_randn((1, 64, 16, 16)),
+                    3,
+                    1,
+                    1,
+                ),
+                "8x64x32_k2_s2_nopad": (
+                    cached_randn((8, 64, 32, 32)),
+                    2,
+                    2,
+                    0,
+                ),
+            },
+        },
         ("test_conv2d", "test_conv2d_cpu"): {
             "param_sets": {
                 "1x3x32_ksize3_no_pad": (
@@ -5229,6 +5257,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             dst_dtype,
             cpu_compile=False,
             run_eager=False,
+        )
+
+    def test_avg_pool2d_cpu(self, x, kernel_size, stride, padding):
+        def fn(x, kernel_size, stride, padding):
+            return torch.avg_pool2d(x, kernel_size, stride=stride, padding=padding)
+
+        self.compare_with_cpu(
+            fn,
+            x,
+            kernel_size,
+            stride,
+            padding,
+            atol=0.5,
+            rtol=0.1,
         )
 
     def test_conv2d_cpu(self, x, weight, bias, padding, stride, groups):
