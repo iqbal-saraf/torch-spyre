@@ -22,6 +22,7 @@ from torch._inductor.utils import (
     get_fused_kernel_name,
     sympy_product,
 )
+from torch._inductor.ir import Reduction
 from torch._inductor.scheduler import (
     BaseScheduling,
     BaseSchedulerNode,
@@ -351,10 +352,14 @@ class SuperDSCScheduling(BaseScheduling):
             for node in node_schedule:
                 var_ranges = iteration_space(node)
                 vars = list(var_ranges.keys())
-                index_vars = [
-                    vars[: len(node._body.iter_vars)],
-                    vars[len(node._body.iter_vars) :],
-                ]
+                if isinstance(node.node.data, Reduction):
+                    n_out = len(node.node.data.get_size())
+                    index_vars = [vars[:n_out], vars[n_out:]]
+                else:
+                    index_vars = [
+                        vars[: len(node._body.iter_vars)],
+                        vars[len(node._body.iter_vars) :],
+                    ]
                 node.codegen(index_vars)
 
         with V.set_kernel_handler(kernel):
@@ -404,10 +409,14 @@ class SuperDSCScheduling(BaseScheduling):
                     for snode in sched:
                         var_ranges = iteration_space(snode)
                         vs = list(var_ranges.keys())
-                        index_vars = [
-                            vs[: len(snode._body.iter_vars)],
-                            vs[len(snode._body.iter_vars) :],
-                        ]
+                        if isinstance(snode.node.data, Reduction):
+                            n_out = len(snode.node.data.get_size())
+                            index_vars = [vs[:n_out], vs[n_out:]]
+                        else:
+                            index_vars = [
+                                vs[: len(snode._body.iter_vars)],
+                                vs[len(snode._body.iter_vars) :],
+                            ]
                         snode.codegen(index_vars)
 
         # Compute per-level tiled symbols for the outer (depth=0) LoopSpec.
@@ -471,10 +480,14 @@ class SuperDSCScheduling(BaseScheduling):
                 for snode in sched:
                     var_ranges = iteration_space(snode)
                     vs = list(var_ranges.keys())
-                    index_vars = [
-                        vs[: len(snode._body.iter_vars)],
-                        vs[len(snode._body.iter_vars) :],
-                    ]
+                    if isinstance(snode.node.data, Reduction):
+                        n_out = len(snode.node.data.get_size())
+                        index_vars = [vs[:n_out], vs[n_out:]]
+                    else:
+                        index_vars = [
+                            vs[: len(snode._body.iter_vars)],
+                            vs[len(snode._body.iter_vars) :],
+                        ]
                     snode.codegen(index_vars)
 
         # Determine this level's tiled symbols using the IR's loop_tiled_dims[depth].
