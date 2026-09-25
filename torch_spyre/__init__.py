@@ -16,6 +16,7 @@ import os
 import threading
 import types
 import importlib
+
 import torch
 
 from .constants import DEVICE_NAME, DISTRIBUTED_BACKEND_NAME
@@ -190,10 +191,8 @@ def make_spyre_module() -> types.ModuleType:
     mod.set_device = lambda idx: impl.set_device(idx)
     mod._is_compiled = lambda: True
     mod.memory = memory
-
-    from torch_spyre.profiler._ffdc import get_diagnostic_report
-
-    mod.get_diagnostic_report = get_diagnostic_report
+    # Public profiler API (eagerly imported above); avoid private _ffdc import.
+    mod.get_diagnostic_report = profiler.get_diagnostic_report
 
     import torch  # noqa: E402
 
@@ -320,6 +319,17 @@ def _autoload_impl():
     # Customops must be imported here because decompositions.py references
     # torch.ops.spyre.* at module level (e.g. torch.ops.spyre.rms_norm).
     import torch_spyre._inductor.customops  # noqa: F401
+
+    # lowering.py is normally imported lazily, only when enable_spyre_context()
+    # actually runs (i.e. only for compiles Inductor detects as Spyre-bound).
+    # tile_dim_marker's lowering is registered directly into the real global
+    # torch._inductor.lowering.lowerings dict (not the CM-scoped
+    # spyre_lowerings dict most Spyre lowerings use) precisely so it is always
+    # present -- including for device-agnostic compiles that never enter Spyre
+    # context, e.g. for_each_tile exercised directly on CPU tensors. That
+    # registration only takes effect once this module has actually executed,
+    # so import it eagerly here rather than leaving it to the lazy path.
+    import torch_spyre._inductor.lowering  # noqa: F401
     from torch_spyre._inductor.decompositions import (
         _register_spyre_dispatchkey_kernels_permanently,
     )
@@ -378,6 +388,10 @@ def _autoload_impl():
     # to have enough cache space for all eager ops
     # You'll get recursion errors if this is exceeded
     torch._dynamo.config.cache_size_limit = 1024
+    # A second, independent cap that dynamo checks before the per-op limit
+    # above, so at its default of 256 it caps the cache whatever
+    # cache_size_limit says.
+    torch._dynamo.config.accumulated_cache_size_limit = 1024
 
     _orig_isAllocatorInitialized = torch._C._accelerator_isAllocatorInitialized
 
@@ -400,7 +414,3 @@ def _autoload_impl():
 
     # Enable spyre code with symbolic args by default
     os.environ.setdefault("BUNDLE_SYMBOLIC_ARGS", "1")
-
-
-if not profiler.is_available():
-    profiler = None

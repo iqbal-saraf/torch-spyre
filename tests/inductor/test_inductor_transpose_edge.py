@@ -109,7 +109,8 @@ class TestTransposeEdge:
         _compare_mode(execution_mode, fn, x)
 
     @pytest.mark.skip(
-        "Issue #1840: Signal Received: 11 (Segmentation fault) for eager and dxp_standalone for compile"
+        "Issue #1840: Signal Received: 11 (Segmentation fault) in eager, and "
+        "in the backend compiler when compiled"
     )
     def test_transpose_strided_tensor(self, execution_mode):
         x = cached_randn((128, 256), dtype=torch.float16)
@@ -195,10 +196,9 @@ class TestTransposeEdge:
         assert torch.allclose(slice1.cpu(), y_cpu[:2, :16, :8, :4])
 
     # --- Materialized copy after transpose (#1859) ---
-    @pytest.mark.xfail(
-        reason="Issue #1859: dxp_standalone SIGABRT on transpose+clone bundle generation.",
-    )
     def test_transpose_then_clone(self, execution_mode):
+        if execution_mode == "eager":
+            pytest.xfail("Issue #1859: SIGABRT on transpose+clone bundle generation.")
         x = cached_randn((72, 91), dtype=torch.float16)
         _compare_mode(execution_mode, lambda t: t.transpose(0, 1).clone(), x)
 

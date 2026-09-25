@@ -5,7 +5,9 @@
 Variables that affect profile capture, telemetry, and observability.
 Debug-oriented variables (`TORCH_SPYRE_DEBUG`, `TORCH_COMPILE_DEBUG`,
 `TORCHINDUCTOR_FORCE_DISABLE_CACHES`, `INDUCTOR_PROVENANCE`,
-`TORCH_TRACE`) live under [Debugging](../debugging/index.md).
+`TORCH_TRACE`) live under [Debugging](../debugging/index.md); the FFDC
+table below re-lists `TORCH_COMPILE_DEBUG` only to note its effect on
+captured artifacts.
 
 ## Logging
 
@@ -66,24 +68,71 @@ The `torch_spyre.*` namespace is only for the `TORCH_LOGS` environment variable.
 |---|---|
 | `SENCORES=<1..32>` | Number of Spyre cores to target (default 32) |
 
+## Compile-time timing
+
+Measures how long the compiler frontend takes, per pass pipeline and per
+pass, with the graph size each pass saw. This is compile time, not runtime:
+nothing here reports how long a kernel takes on device.
+
+| Variable | Effect |
+|---|---|
+| `TORCH_SPYRE_TIMING=1` | Record structured frontend compile timings (default off) |
+| `TORCH_SPYRE_TIMING_OUT=path/rec.json` | Write the record to `path/rec.<pid>.json` at process exit. Empty keeps events in memory only |
+
+```bash
+TORCH_SPYRE_TIMING=1 TORCH_SPYRE_TIMING_OUT=/tmp/rec.json python3 my_model.py
+# -> /tmp/rec.<pid>.json
+```
+
+Each event carries `inclusive_ns` and `self_ns` (inclusive minus direct
+children), so a pipeline total and its per-pass breakdown can be read from
+one record. Event names have three shapes:
+
+| Name | Region |
+|---|---|
+| `pipeline:<PipelineClass>` | One pass pipeline, start to finish |
+| `pass:<PipelineClass>:<pass_name>` | One pass within it |
+| `stage:<PipelineClass>:<what>` | Work a pipeline does around its passes (`pass_loop`, `cost_model`, `cost_dump`, `finalize_work_division`, and the `log_before` / `log_after` IR dumps when INFO logging is on) |
+
 ## FFDC (First Failure Data Capture)
 
 | Variable | Effect |
 |---|---|
-| `USE_SPYRE_PROFILER=1` | Opt in to automatic FFDC JSON reports on Spyre compile / runtime / unimplemented failures. Retrieve with `torch.spyre.get_diagnostic_report()`. (Same name as the CMake profiler build flag; at runtime this env var alone gates capture.) |
+| `TORCH_SPYRE_FFDC=1` | Opt in to automatic FFDC JSON reports on Spyre frontend-compile / backend-compile / runtime / unimplemented failures. Retrieve with `torch.spyre.get_diagnostic_report()`. Separate from `USE_SPYRE_PROFILER` (the `setup.py` Kineto build flag); this env var alone gates capture at runtime and is not set by default on pods. |
+| `TORCH_COMPILE_DEBUG=1` | Optional. Writes `torch_compile_debug/` artifacts that FFDC links into `artifacts.paths` (see [FFDC user guide](ffdc.md)). Not required for capture. |
+| `DUMP_SPYRE_CODE=1` | Optional. Emits `sdsc_*.json` and `*.mlir` bundle files that FFDC can reference. Not required for capture. |
+
+See the [FFDC user guide](ffdc.md) for the full workflow, report locations,
+and pod/CI usage.
 
 ## Device enumeration
 
-Read by torch-spyre
-([`spyre_device_enum.cpp`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_device_enum.cpp))
-at startup to discover the Spyre devices visible to the process.
+Honored by the `flex` library itself (not read directly by torch-spyre)
+when [`spyre_device_enum.cpp`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_device_enum.cpp)
+calls `flex::getNumDevices()` to determine how many Spyre devices are
+visible to the process:
 
 | Variable | Effect |
 |---|---|
-| `PCIDEVICE_IBM_COM_AIU_PF` | Comma-separated list of PCI bus IDs assigned to the container (set by the OpenShift AIU operator or manually) |
-| `AIU_WORLD_RANK_<N>` | PCI bus ID bound to rank `N` |
+| `FLEX_DEVICE` | Device type: `PF`, `VF`, or `MOCK`. Selects how device count is determined |
+| `AIU_WORLD_SIZE` | Number of devices to use; caps the total device count (or is returned directly under `FLEX_DEVICE=MOCK`) |
 | `SPYRE_DEVICES` | Comma-separated list of device indices to use (e.g., `0,2,3`); overrides the default enumeration |
-| `LOCAL_RANK` | Per-process rank set by `torchrun`; used to select the device for each child process |
+
+Read directly by torch-spyre
+([`spyre_guard.cpp`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_guard.cpp))
+to pick the device for the current process:
+
+| Variable | Effect |
+|---|---|
+| `LOCAL_RANK` | Per-process rank set by `torchrun`; used to select the device for each child process (defaults to 0 if unset) |
+
+Set by the OpenShift AIU operator (or manually); not read directly by
+torch-spyre's device-enumeration code:
+
+| Variable | Effect |
+|---|---|
+| `PCIDEVICE_IBM_COM_AIU_PF` | Comma-separated list of PCI bus IDs assigned to the container; consumed by [`tests/oot_framework/run_test.sh`](https://github.com/torch-spyre/torch-spyre/blob/main/tests/oot_framework/run_test.sh) |
+| `AIU_WORLD_RANK_<N>` | PCI bus ID bound to rank `N`; not consumed in-tree — it is scraped back out of pod logs after the fact by [`.github/scripts/parse_hw_failures.py`](https://github.com/torch-spyre/torch-spyre/blob/main/.github/scripts/parse_hw_failures.py) |
 
 ## Runtime / driver (for `aiu-smi` and `aiu-trace-analyzer`)
 

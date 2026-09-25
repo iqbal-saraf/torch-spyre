@@ -365,32 +365,40 @@ class TestPrepareKernel:
             with pytest.raises(RuntimeError, match="Step index out of range"):
                 job_plan.get_step_type(999)
 
-    def test_compute_on_host_valid(self):
-        """Test that a valid ComputeOnHost command builds successfully.
+    def test_prepare_emits_bare_split_triple(self):
+        """prepare emits the bare split triple, independent of the flag.
 
-        Verifies that a well-formed ComputeOnHost entry with all required
-        fields (ohandle, size, ishape, ihandle, hcm) successfully builds
-        a JobPlan.
+        PrepareKernel emits the plain [HostCompute, H2D, Compute] triple with
+        NO cross-stream event steps, carrying its by-type roles [Prep, Prep,
+        Dev] -- so the launch router splits it across S_prep/S_dev while flex
+        inserts the cross-stream RAW/WAR edges dynamically at enqueue. There is
+        no plan rewrite and no event-step emission (3 steps, never 7).
+
+        SPYRE_HAZARD_TRACKER only affects launch-time routing (whether the
+        S_prep/S_dev split engages), never the prepared plan's shape, so this
+        holds regardless of the flag.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = self.create_mock_spyrecode(
                 tmpdir, exec_command="ComputeOnHost"
             )
-
-            # Should succeed without exceptions
+            # Must NOT raise: prepare emits the plain triple unconditionally
+            # (the static-edge block and its region-count TORCH_CHECK are
+            # gone), so nothing here depends on the program-region count.
             job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
 
             # Verify JobPlan was created
             assert job_plan is not None
             assert isinstance(job_plan, torch_spyre._C.JobPlan)
 
-            # Verify it has 3 steps (HostCompute, H2D, Compute)
-            assert job_plan.num_steps() == 3
+            # Verify it has 2 steps (HostCompute-with-H2D merged, Compute)
+            # The adjacent DataTransfer H2D is collapsed into the HostCompute step
+            # by translateComputeOnHostWithH2D
+            assert job_plan.num_steps() == 2
 
             # Verify the step types
             assert job_plan.get_step_type(0) == "HostCompute"
-            assert job_plan.get_step_type(1) == "H2D"
-            assert job_plan.get_step_type(2) == "Compute"
+            assert job_plan.get_step_type(1) == "Compute"
 
     def test_compute_on_host_missing_ohandle(self):
         """Test that missing ohandle field raises RuntimeError."""
@@ -717,17 +725,28 @@ class TestPrepareKernel:
                 self._prepare_with_symbolic_args(spyrecode_dir, symbolic_args=True)
 
     def test_pipeline_barrier_dma_steps_default_true(self):
-        """H2D and D2H steps must carry pipeline_barrier=True by default."""
+        """H2D (merged into HostCompute) and D2H steps carry pipeline_barrier correctly.
+
+        Tthe correction H2D is owned by the HostCompute step; The plan no longer contains
+        a separate H2D step at index 1.  We instead verify that the merged HostCompute
+        step carries pipeline_barrier=False (overlap-eligible) and the Compute step at
+        index 1 carries True.
+        """
         with tempfile.TemporaryDirectory() as tmpdir:
-            # H2D: produced inside the correction sequence at step index 1
             spyrecode_dir = self.create_mock_spyrecode(
                 tmpdir, exec_command="ComputeOnHost"
             )
             job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
 
-            assert job_plan.get_step_type(1) == "H2D"
+            # After merge: HostCompute(0) → Compute(1); no standalone H2D step.
+            assert job_plan.num_steps() == 2
+            assert job_plan.get_step_type(0) == "HostCompute"
+            assert job_plan.get_step_type(1) == "Compute"
+            assert job_plan.get_step_pipeline_barrier(0) is False, (
+                "HostCompute (merged) must be overlap-eligible: pipeline_barrier=False"
+            )
             assert job_plan.get_step_pipeline_barrier(1) is True, (
-                "H2D step must carry pipeline_barrier=True by default"
+                "Compute step must carry pipeline_barrier=True by default"
             )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -754,11 +773,14 @@ class TestPrepareKernel:
             )
 
     def test_pipeline_barrier_correction_sequence(self):
-        """Correction sequence: HostCompute=False, H2D=True, Compute=True.
+        """Every step of the correction triple keeps barrier=True.
 
-        HostCompute opts out (overlap-eligible: runs while prior device compute
-        is in flight). H2D and Compute inherit the safe default True. Compute
-        must wait for H2D to close the RAW hazard on the seg-7 correction region.
+        The two-stream PoC preserves STRICT per-stream FIFO for ALL ops,
+        including HostCompute: overlap comes from the S_prep/S_dev stream split
+        plus flex's dynamic cross-stream RAW/WAR edges, NOT from relaxing any
+        op's pipeline_barrier. So no step in the correction triple
+        ([HostCompute, H2D, Compute]) may opt out of the barrier -- in
+        particular HostCompute must NOT carry the old barrier=False.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = self.create_mock_spyrecode(
@@ -766,26 +788,22 @@ class TestPrepareKernel:
             )
             job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
 
-            # Correction sequence: HostCompute(0) → H2D(1) → Compute(2)
-            assert job_plan.num_steps() == 3
+            # After the HC+H2D merge: HostCompute(0) → Compute(1)
+            # The adjacent DataTransfer H2D is collapsed into the HostCompute step.
+            assert job_plan.num_steps() == 2
             assert job_plan.get_step_type(0) == "HostCompute"
-            assert job_plan.get_step_type(1) == "H2D"
-            assert job_plan.get_step_type(2) == "Compute"
+            assert job_plan.get_step_type(1) == "Compute"
 
             assert job_plan.get_step_pipeline_barrier(0) is False, (
                 "HostCompute step must carry pipeline_barrier=False to preserve "
-                "host/device overlap (correction callback runs while prior device "
-                "compute is still in flight)"
+                "host/device overlap (produce runs while prior device compute "
+                "is still in flight)"
             )
             assert job_plan.get_step_pipeline_barrier(1) is True, (
-                "H2D step must carry pipeline_barrier=True (safe default: "
-                "inherited from base class)"
-            )
-            assert job_plan.get_step_pipeline_barrier(2) is True, (
                 "Compute step must carry pipeline_barrier=True: it is a "
-                "consumer of H2D's seg-7 write (RAW hazard); Compute must "
-                "wait for H2D. Inert under STRICT_ORDERING; load-bearing "
-                "under OP_ORDERING."
+                "consumer of the correction H2D's seg-7 write (RAW hazard); "
+                "Compute must wait for H2D. Inert under STRICT_ORDERING; "
+                "load-bearing under OP_ORDERING."
             )
 
     def test_pipeline_barrier_pure_compute_true(self):
