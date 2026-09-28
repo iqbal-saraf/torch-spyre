@@ -3147,6 +3147,12 @@ def conv2d_via_bmm_decomp(
     # non-fp16) fall through and decompose to im2col+matmul as before. This is
     # the compile-path target; the flag defaults off so eager and default
     # compile behavior are unchanged.
+    #
+    # NOTE: this first call passes the *original* input shape, so for a
+    # 5-dimensional (Conv3D) input it always returns False -- _is_direct_conv_
+    # supported gates on len(input_shape) == 4. The direct deferral for a
+    # temporal-1 Conv3D is decided later, by the *second* call below on the
+    # folded 4D shapes; here a 5D input simply proceeds into the fold branch.
     if _will_lower_conv2d_direct(
         input.shape,
         input.dtype,
@@ -3196,20 +3202,16 @@ def conv2d_via_bmm_decomp(
                 f"padding and unit depth dilation (got kD={K_d}, "
                 f"stride_d={stride[0]}, pad_d={padding[0]}, dil_d={dilation[0]})"
             )
-        # A grouped/depthwise fold is out of scope: will_direct is binary
-        # (direct vs im2col), but the 4D body has a third exit -- the
-        # C_in == groups == C_out depthwise branch (spyre.conv2d_with_bias),
-        # which needs C on the stick. A depthwise conv3d predicts
-        # will_direct=False (the direct predicate requires groups==1) -> folds
-        # row-major -> lands in that channel-last branch with the wrong layout
-        # and fails obscurely downstream. Reject it here instead, so the binary
-        # layout decision below is exactly the routing the recursion will take.
-        if groups != 1:
-            raise Unsupported(
-                "conv2d_via_bmm: grouped/depthwise temporal-1 Conv3D is not "
-                f"supported (got groups={groups})"
-            )
-
+        # A grouped (groups != 1) temporal-1 conv3d is NOT rejected: it folds
+        # through into conv2d_via_bmm_decomp's grouped im2col+matmul branch. The
+        # direct SDSC predicate requires groups==1, so a grouped conv predicts
+        # will_direct=False -> folds row-major (W on the stick), exactly the
+        # layout the 4D im2col path wants, and the recursive 4D conv lands in the
+        # `groups != 1` grouped-matmul branch. Depthwise conv3d (the
+        # C_in==groups==C_out sub-case, whose 4D exit is the channel-last
+        # spyre.conv2d_with_bias SDSC) is never exercised through this fold, so
+        # no depthwise carve-out is needed here; the binary will_direct layout
+        # decision below matches the routing the grouped recursion takes.
         conv2d_stride = [stride[1], stride[2]]
         conv2d_padding = [padding[1], padding[2]]
         conv2d_dilation = [dilation[1], dilation[2]]

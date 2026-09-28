@@ -5542,6 +5542,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     1,
                 ),
+                # Genuinely grouped (non-depthwise) conv2d: groups=2 with
+                # C_in=16 -> C_in_per_group=8 and C_out=32 -> C_out_per_group=16.
+                # Since C_in != groups (not depthwise) and groups != 1, this
+                # rides conv2d_via_bmm_decomp's grouped im2col+matmul branch
+                # (spyre.unfold + a batched grouped matmul), the path the
+                # reviewer noted "can also handle groups != 1".
+                "1x16x32_ksize3_groups2": (
+                    cached_randn((1, 16, 32, 32)),
+                    cached_randn((32, 8, 3, 3)),
+                    None,
+                    (1, 1),
+                    (1, 1),
+                    2,
+                ),
             },
         },
         ("test_dwise_conv2d", "test_dwise_conv2d_cpu"): {
@@ -8999,6 +9013,43 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 run_eager=False,
             )
 
+    def test_conv3d_via_conv2d_grouped(self):
+        # Routing policy for a temporal-1 Conv3D, with direct lowering ON (the
+        # realistic config): groups == 1 uses the native conv2d SDSC (direct),
+        # but a genuinely grouped (groups != 1) conv CANNOT -- the direct
+        # predicate requires groups == 1 -- so it is NOT rejected; it folds
+        # through into conv2d_via_bmm_decomp's grouped im2col+matmul branch.
+        #
+        # This pins conv2d_direct_lowering ON and runs a groups=2 conv3d
+        # (C_in=6 -> C_in_per_group=3, C_out=16) to prove the grouped fold-through
+        # works end-to-end even when direct lowering is enabled: the grouped conv
+        # predicts will_direct=False, folds row-major (the layout im2col wants),
+        # and the recursive 4D conv lands in the grouped-matmul branch.
+        #
+        # Inputs are plain row-major NCDHW: im2col linearizes the channels into
+        # the matmul contraction and wants the ordinary contiguous layout (a
+        # channel-last weight is unrepresentable for the im2col reshape, see
+        # test_conv3d_via_conv2d_im2col_base).
+        #
+        # run_eager=False: Spyre has no eager conv3d kernel; only the compiled
+        # (fold + im2col) path is valid here.
+        x = cached_randn((1, 6, 2, 8, 8))
+        weight = cached_randn((16, 3, 1, 4, 4))
+
+        def fn(xc, wc, b):
+            return torch.conv3d(xc, wc, b, stride=(1, 4, 4), padding=0, groups=2)
+
+        with mock.patch.object(inductor_config, "conv2d_direct_lowering", True):
+            self.compare_with_cpu(
+                fn,
+                x,
+                weight,
+                None,
+                atol=0.5,
+                rtol=0.1,
+                run_eager=False,
+            )
+
     def test_conv3d_via_conv2d_temporal1_gate(self):
         # Pure-Python guard check (no compile/hardware) of the
         # conv2d_via_bmm_decomp 5D branch. Only the *temporal* geometry gates the
@@ -9041,14 +9092,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     _call(pad_d=1)
                 with self.assertRaises(Unsupported):
                     _call(dil_d=2)
-                # Grouped/depthwise fold is out of scope: will_direct is binary
-                # (direct vs im2col) and cannot express the 4D depthwise exit,
-                # so a temporal-1 conv3d with groups != 1 must be rejected here
-                # rather than mis-folded into the wrong layout.
-                with self.assertRaises(Unsupported):
-                    _call(groups=2)
-                with self.assertRaises(Unsupported):
-                    _call(groups=64)  # depthwise
+                # Note: a grouped (groups != 1) temporal-1 conv3d is NO LONGER
+                # rejected here -- it folds through into conv2d_via_bmm_decomp's
+                # grouped im2col+matmul branch (see the 5D branch comment and the
+                # end-to-end test_conv3d_via_conv2d_grouped case), so it is
+                # intentionally not asserted to raise.
 
                 # Temporal-1 passes the gate: it must NOT raise Unsupported. It
                 # proceeds into the fold, whose reshape_via_cpu has no CPU kernel
