@@ -3271,20 +3271,20 @@ def conv2d_via_bmm_decomp(
             w4 = torch.permute(w_cl, (3, 0, 1, 2))
         else:
             # Default row-major fold (W on the stick), the layout the im2col path
-            # accepts. Permute D next to N and squeeze it into the batch; merging
-            # the two leading dims (N,D) leaves W on the stick, so the reshape is
-            # a pure on-device view. The weight's unit depth tap is a size-1 view.
+            # accepts. Permute D next to N and merge them into the batch. These
+            # input folds stay on-device: realize each with spyre.compact -- a
+            # relayout copy at the merged shape, NOT a device->host->device round-
+            # trip -- so the im2col+matmul decomposition sees a single batch range
+            # (mirroring the direct branch's N*D merge). Only the final output
+            # reshape needs the host round-trip (see out5 below); these inputs do
+            # not.
             # activation (N,C,D,H,W) -> view (N,D,C,H,W) -> (N*D,C,H,W).
             x_dchw = torch.permute(input, (0, 2, 1, 3, 4)).contiguous()
-            x4 = x_dchw.reshape(N * D, C_in, H_in, W_in)
-            if N > 1 and D > 1:
-                # Same non-unit (N,D) outer-merge realize as the direct branch:
-                # collapse the two batch ranges on-device (spyre.compact, no
-                # host round-trip) so the downstream 4D path sees one [N*D,...]
-                # batch dim. Degenerate (size-1 N or D) merges stay a pure view.
-                x4 = torch.ops.spyre.compact(x4)
+            x4 = torch.ops.spyre.compact(x_dchw.reshape(N * D, C_in, H_in, W_in))
             # weight (C_out,C_in,1,kH,kW) -> (C_out,C_in,kH,kW).
-            w4 = weight.reshape(C_out, C_in_per_group, K_h, K_w)
+            w4 = torch.ops.spyre.compact(
+                weight.reshape(C_out, C_in_per_group, K_h, K_w)
+            )
 
         # Recurse into the 4D conv path; bias is added once, on the C_out dim,
         # inside the inner conv (folding D into the batch leaves C_out intact),
@@ -3314,11 +3314,26 @@ def conv2d_via_bmm_decomp(
             out_cl = torch.permute(out4, (0, 2, 3, 1)).contiguous()
             out_cl = out_cl.reshape(N, D, H_out, W_out, C_out_o)
             return torch.permute(out_cl, (0, 4, 1, 2, 3))
-        # Row-major: splitting the leading N*D keeps W on the stick, so it is a
-        # pure on-device view.
+        # Row-major: split the leading N*D back to N,D. This one output reshape
+        # DELIBERATELY keeps the reshape_via_cpu host round-trip; the x4/w4 input
+        # folds above are on-device. Under LX scratchpad planning the row-major
+        # im2col+matmul leaves this output tensor with a stick (innermost) index
+        # of the affine form `2*d2 + d3`, which the work-division pass rejects
+        # (`Unsupported: Unexpected stick expression ..., expected Mod(var, 64),
+        # a bare variable, 0, ...` from _check_stick_expr_supported). Neither a
+        # pure view nor an on-device realize (spyre.compact) here avoids it --
+        # both propagate that index, so all six wrapped
+        # test_conv3d_via_conv2d_{grouped,im2col_*} LX-planning cases fail.
+        # Narrowing confirmed the bad stick comes solely from this output layout,
+        # not the input folds. reshape_via_cpu returns a freshly contiguous,
+        # cleanly-stickified buffer (bare-variable stick index), the only form
+        # that keeps the row-major path legal. The limitation is in LX/work-
+        # division stick-expression support, not the fold; until that is lifted
+        # the host trip stays on this single reshape. The direct path (the common
+        # channel-last case) is fully on-device.
         # view (N*D,C_out,H_out,W_out) -> (N,D,C_out,H_out,W_out)
         # -> view (N,C_out,D,H_out,W_out).
-        out5 = out4.reshape(N, D, C_out_o, H_out, W_out)
+        out5 = torch.ops.spyre.reshape_via_cpu(out4, (N, D, C_out_o, H_out, W_out))
         return torch.permute(out5, (0, 2, 1, 3, 4))
 
     if input.dim() != 4:
