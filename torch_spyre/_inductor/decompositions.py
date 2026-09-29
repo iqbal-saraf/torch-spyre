@@ -3240,36 +3240,51 @@ def conv2d_via_bmm_decomp(
         )
 
         if will_direct:
-            # Channel-last fold: reshape_via_cpu returns default row-major
-            # layout, so the *innermost logical* dim lands on the stick. Reshape
-            # in channel-last order (C innermost) and expose the logical NCHW /
-            # [C_out, C_in, kH, kW] shape with a permute VIEW -- exactly the form
-            # the 4D direct path receives its inputs (NHWC-contiguous viewed as
-            # NCHW), so C_in / C_out stay on the stick.
+            # Channel-last fold. The permute+contiguous physically lays the
+            # tensor out channel-last (C innermost -> on the Spyre stick). The
+            # following reshape only merges the two leading dims (N,D) / squeezes
+            # the unit depth tap; it never touches the innermost (stick) dim, so
+            # it is a pure view that lowers on-device -- no host round-trip. Then
+            # expose the logical NCHW / [C_out, C_in, kH, kW] shape with a permute
+            # VIEW, exactly the form the 4D direct path receives its inputs
+            # (NHWC-contiguous viewed as NCHW), so C_in / C_out stay on the stick.
             # activation (N,C,D,H,W) -> view (N,D,H,W,C) -> (N*D,H,W,C)
             #            -> view (N*D,C,H,W).
             x_cl = torch.permute(input, (0, 2, 3, 4, 1)).contiguous()
-            x_cl = torch.ops.spyre.reshape_via_cpu(x_cl, (N * D, H_in, W_in, C_in))
+            x_cl = x_cl.reshape(N * D, H_in, W_in, C_in)
+            if N > 1 and D > 1:
+                # Merging two non-unit outer dims (N,D) as a pure view leaves
+                # both as separate device ranges, so the folded conv2d's SDSC
+                # iteration space carries an extra dim and codegen indexes past
+                # its dim_labels (IndexError in parse_op_spec). Realize the
+                # merge on-device with spyre.compact -- a relayout copy at the
+                # merged [N*D,...] shape, NOT a host round-trip -- so the conv
+                # sees a single batch range. A size-1 N or D merges for free
+                # (degenerating to a squeeze), so the plain view suffices there.
+                x_cl = torch.ops.spyre.compact(x_cl)
             x4 = torch.permute(x_cl, (0, 3, 1, 2))
             # weight (C_out,C_in,1,kH,kW) -> view (C_in,1,kH,kW,C_out)
-            #        -> (C_in,kH,kW,C_out) -> view (C_out,C_in,kH,kW). This also
-            # squeezes the unit depth tap.
+            #        -> (C_in,kH,kW,C_out) -> view (C_out,C_in,kH,kW). Squeezing
+            # the unit depth tap is a size-1 view; C_out stays on the stick.
             w_cl = torch.permute(weight, (1, 2, 3, 4, 0)).contiguous()
-            w_cl = torch.ops.spyre.reshape_via_cpu(
-                w_cl, (C_in_per_group, K_h, K_w, C_out)
-            )
+            w_cl = w_cl.reshape(C_in_per_group, K_h, K_w, C_out)
             w4 = torch.permute(w_cl, (3, 0, 1, 2))
         else:
             # Default row-major fold (W on the stick), the layout the im2col path
-            # accepts. Permute D next to N and squeeze it into the batch; the
-            # weight's unit depth tap is a pure reshape.
+            # accepts. Permute D next to N and squeeze it into the batch; merging
+            # the two leading dims (N,D) leaves W on the stick, so the reshape is
+            # a pure on-device view. The weight's unit depth tap is a size-1 view.
             # activation (N,C,D,H,W) -> view (N,D,C,H,W) -> (N*D,C,H,W).
             x_dchw = torch.permute(input, (0, 2, 1, 3, 4)).contiguous()
-            x4 = torch.ops.spyre.reshape_via_cpu(x_dchw, (N * D, C_in, H_in, W_in))
+            x4 = x_dchw.reshape(N * D, C_in, H_in, W_in)
+            if N > 1 and D > 1:
+                # Same non-unit (N,D) outer-merge realize as the direct branch:
+                # collapse the two batch ranges on-device (spyre.compact, no
+                # host round-trip) so the downstream 4D path sees one [N*D,...]
+                # batch dim. Degenerate (size-1 N or D) merges stay a pure view.
+                x4 = torch.ops.spyre.compact(x4)
             # weight (C_out,C_in,1,kH,kW) -> (C_out,C_in,kH,kW).
-            w4 = torch.ops.spyre.reshape_via_cpu(
-                weight, (C_out, C_in_per_group, K_h, K_w)
-            )
+            w4 = weight.reshape(C_out, C_in_per_group, K_h, K_w)
 
         # Recurse into the 4D conv path; bias is added once, on the C_out dim,
         # inside the inner conv (folding D into the batch leaves C_out intact),
@@ -3290,16 +3305,20 @@ def conv2d_via_bmm_decomp(
         # layout so the returned logical NCDHW tensor is correct either way.
         _, C_out_o, H_out, W_out = out4.shape
         if will_direct:
+            # out4 is logical NCHW but physically NHWC-contiguous (C_out on the
+            # stick); make that explicit with a permute+contiguous, then split the
+            # leading N*D back to N,D -- a stick-preserving view -- and permute to
+            # the logical NCDHW result.
             # view (N*D,H_out,W_out,C_out) -> (N,D,H_out,W_out,C_out)
             # -> view (N,C_out,D,H_out,W_out).
             out_cl = torch.permute(out4, (0, 2, 3, 1)).contiguous()
-            out_cl = torch.ops.spyre.reshape_via_cpu(
-                out_cl, (N, D, H_out, W_out, C_out_o)
-            )
+            out_cl = out_cl.reshape(N, D, H_out, W_out, C_out_o)
             return torch.permute(out_cl, (0, 4, 1, 2, 3))
-        # Row-major: view (N*D,C_out,H_out,W_out) -> (N,D,C_out,H_out,W_out)
+        # Row-major: splitting the leading N*D keeps W on the stick, so it is a
+        # pure on-device view.
+        # view (N*D,C_out,H_out,W_out) -> (N,D,C_out,H_out,W_out)
         # -> view (N,C_out,D,H_out,W_out).
-        out5 = torch.ops.spyre.reshape_via_cpu(out4, (N, D, C_out_o, H_out, W_out))
+        out5 = out4.reshape(N, D, C_out_o, H_out, W_out)
         return torch.permute(out5, (0, 2, 1, 3, 4))
 
     if input.dim() != 4:
