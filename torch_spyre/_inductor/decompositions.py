@@ -3257,11 +3257,14 @@ def conv2d_via_bmm_decomp(
                 # both as separate device ranges, so the folded conv2d's SDSC
                 # iteration space carries an extra dim and codegen indexes past
                 # its dim_labels (IndexError in parse_op_spec). Realize the
-                # merge on-device with spyre.compact -- a relayout copy at the
-                # merged [N*D,...] shape, NOT a host round-trip -- so the conv
-                # sees a single batch range. A size-1 N or D merges for free
+                # merge on-device with a contiguous clone -- a relayout copy at
+                # the merged [N*D,...] shape, NOT a host round-trip -- so the
+                # conv sees a single batch range. (clone, not spyre.compact:
+                # compact targets single-element stick dims and otherwise just
+                # copies, so a clone states the "copy to realize the view"
+                # intent directly.) A size-1 N or D merges for free
                 # (degenerating to a squeeze), so the plain view suffices there.
-                x_cl = torch.ops.spyre.compact(x_cl)
+                x_cl = x_cl.clone(memory_format=torch.contiguous_format)
             x4 = torch.permute(x_cl, (0, 3, 1, 2))
             # weight (C_out,C_in,1,kH,kW) -> view (C_in,1,kH,kW,C_out)
             #        -> (C_in,kH,kW,C_out) -> view (C_out,C_in,kH,kW). Squeezing
@@ -3272,18 +3275,22 @@ def conv2d_via_bmm_decomp(
         else:
             # Default row-major fold (W on the stick), the layout the im2col path
             # accepts. Permute D next to N and merge them into the batch. These
-            # input folds stay on-device: realize each with spyre.compact -- a
-            # relayout copy at the merged shape, NOT a device->host->device round-
-            # trip -- so the im2col+matmul decomposition sees a single batch range
-            # (mirroring the direct branch's N*D merge). Only the final output
-            # reshape needs the host round-trip (see out5 below); these inputs do
-            # not.
+            # input folds stay on-device: realize each with a contiguous clone --
+            # a relayout copy at the merged shape, NOT a device->host->device
+            # round-trip -- so the im2col+matmul decomposition sees a single
+            # batch range (mirroring the direct branch's N*D merge). (clone, not
+            # spyre.compact: compact targets single-element stick dims and
+            # otherwise just copies, so a clone states the "copy to realize the
+            # view" intent directly.) Only the final output reshape needs the
+            # host round-trip (see out5 below); these inputs do not.
             # activation (N,C,D,H,W) -> view (N,D,C,H,W) -> (N*D,C,H,W).
             x_dchw = torch.permute(input, (0, 2, 1, 3, 4)).contiguous()
-            x4 = torch.ops.spyre.compact(x_dchw.reshape(N * D, C_in, H_in, W_in))
+            x4 = x_dchw.reshape(N * D, C_in, H_in, W_in).clone(
+                memory_format=torch.contiguous_format
+            )
             # weight (C_out,C_in,1,kH,kW) -> (C_out,C_in,kH,kW).
-            w4 = torch.ops.spyre.compact(
-                weight.reshape(C_out, C_in_per_group, K_h, K_w)
+            w4 = weight.reshape(C_out, C_in_per_group, K_h, K_w).clone(
+                memory_format=torch.contiguous_format
             )
 
         # Recurse into the 4D conv path; bias is added once, on the C_out dim,
@@ -3321,16 +3328,21 @@ def conv2d_via_bmm_decomp(
         # of the affine form `2*d2 + d3`, which the work-division pass rejects
         # (`Unsupported: Unexpected stick expression ..., expected Mod(var, 64),
         # a bare variable, 0, ...` from _check_stick_expr_supported). Neither a
-        # pure view nor an on-device realize (spyre.compact) here avoids it --
-        # both propagate that index, so all six wrapped
+        # pure view nor an on-device realize (a contiguous clone) here avoids it
+        # -- both propagate that index, so all six wrapped
         # test_conv3d_via_conv2d_{grouped,im2col_*} LX-planning cases fail.
         # Narrowing confirmed the bad stick comes solely from this output layout,
         # not the input folds. reshape_via_cpu returns a freshly contiguous,
         # cleanly-stickified buffer (bare-variable stick index), the only form
         # that keeps the row-major path legal. The limitation is in LX/work-
         # division stick-expression support, not the fold; until that is lifted
-        # the host trip stays on this single reshape. The direct path (the common
-        # channel-last case) is fully on-device.
+        # the host trip stays on this single reshape. The direct path (the
+        # common channel-last case) is fully on-device.
+        # TODO: extend torch-spyre work-division stick-expression support
+        # (pass_utils._check_stick_expr_supported / alignment_coordinates) to
+        # represent affine stick indices like `2*d2 + d3`, so an on-device clone
+        # can realize this output and the host round-trip can be dropped. See
+        # torch-spyre/torch-spyre#5142 (conv3d-fold follow-up).
         # view (N*D,C_out,H_out,W_out) -> (N,D,C_out,H_out,W_out)
         # -> view (N,C_out,D,H_out,W_out).
         out5 = torch.ops.spyre.reshape_via_cpu(out4, (N, D, C_out_o, H_out, W_out))
