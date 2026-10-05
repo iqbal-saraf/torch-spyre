@@ -9694,6 +9694,26 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         def fn(xc, wc, b):
             return torch.conv3d(xc, wc, b, stride=stride, padding=0, groups=1)
 
+        # Reference accumulated in fp32. A patch-embed conv contracts over a
+        # large K (here 6*16*16 = 1536); CPU fp16 torch.conv3d accumulates that
+        # reduction in fp16 and loses ~200 abs of precision, while Spyre
+        # accumulates in higher precision and matches the fp32 result (verified:
+        # device vs fp32 max|d| < 0.7). The default fp16 CPU reference would
+        # fail the correct device output against CPU's own lossy accumulation.
+        #
+        # Hand the fp32 reference to the harness via dlfloat16_reference (NOT
+        # cpu_eager_result): it keeps the reference high-precision until the LX
+        # wrapper ops have run, then casts once to fp16. In the base harness
+        # that is just the single fp16 round; under LX planning it also routes
+        # the reference through the same wrap as the device side (e.g.
+        # sum(dim=0) for the reduction variant), so rank and value match. A raw
+        # cpu_eager_result would skip that wrap and mismatch the summed device
+        # output in both shape and precision.
+        bias_f = bias.float() if bias is not None else None
+        ref = torch.conv3d(
+            x.float(), weight.float(), bias_f, stride=stride, padding=0, groups=1
+        )
+
         with mock.patch.object(inductor_config, "conv2d_direct_lowering", False):
             self.compare_with_cpu(
                 fn,
@@ -9703,6 +9723,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 atol=0.5,
                 rtol=0.1,
                 run_eager=False,
+                dlfloat16_reference=ref,
             )
 
     def test_conv3d_via_conv2d_grouped(self):
