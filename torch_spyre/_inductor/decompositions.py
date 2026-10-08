@@ -3310,6 +3310,20 @@ def conv2d_via_bmm_decomp(
                 f"padding and unit depth dilation (got kD={K_d}, "
                 f"stride_d={stride[0]}, pad_d={padding[0]}, dil_d={dilation[0]})"
             )
+        # Folding depth into batch merges N and D into one range (N*D). When both
+        # are non-unit this merge cannot be expressed as a pure view: the direct
+        # conv2d SDSC would then carry two outer ranges and codegen indexes past
+        # its dim_labels (IndexError in parse_op_spec at superdsc.py). A size-1 N
+        # or D merges for free (the fold degenerates to a squeeze), so N==1 (any
+        # D -- e.g. Prithvi's 1x6x4x224x224 patch embed) and D==1 (any N) are
+        # fine. Reject the N>1 AND D>1 case up front rather than materialising the
+        # merge with an on-device relayout copy; it is not currently supported.
+        if N > 1 and D > 1:
+            raise Unsupported(
+                "conv2d_via_bmm: temporal-1 Conv3D with both batch N>1 and "
+                f"depth D>1 is not supported (got N={N}, D={D}); only N==1 "
+                "(any D) or D==1 (any N) folds to a single batch range."
+            )
         # A grouped (groups != 1) temporal-1 conv3d is NOT rejected: it folds
         # through into conv2d_via_bmm_decomp's grouped im2col+matmul branch. The
         # direct SDSC predicate requires groups==1, so a grouped conv predicts
@@ -3352,34 +3366,17 @@ def conv2d_via_bmm_decomp(
             # tensor out channel-last (C innermost -> on the Spyre stick). The
             # following reshape only merges the two leading dims (N,D) / squeezes
             # the unit depth tap; it never touches the innermost (stick) dim, so
-            # it is a pure view that lowers on-device -- no host round-trip. Then
-            # expose the logical NCHW / [C_out, C_in, kH, kW] shape with a permute
-            # VIEW, exactly the form the 4D direct path receives its inputs
-            # (NHWC-contiguous viewed as NCHW), so C_in / C_out stay on the stick.
+            # it is a pure view that lowers on-device -- no host round-trip. With
+            # N>1 AND D>1 already rejected above, at most one of N,D is non-unit,
+            # so the merge always degenerates to a squeeze (a true view) and no
+            # on-device relayout copy is needed. Then expose the logical NCHW /
+            # [C_out, C_in, kH, kW] shape with a permute VIEW, exactly the form
+            # the 4D direct path receives its inputs (NHWC-contiguous viewed as
+            # NCHW), so C_in / C_out stay on the stick.
             # activation (N,C,D,H,W) -> view (N,D,H,W,C) -> (N*D,H,W,C)
             #            -> view (N*D,C,H,W).
             x_cl = torch.permute(input, (0, 2, 3, 4, 1)).contiguous()
             x_cl = x_cl.reshape(N * D, H_in, W_in, C_in)
-            if N > 1 and D > 1:
-                # Merging two non-unit outer dims (N,D) as a pure view leaves
-                # both as separate device ranges, so the folded conv2d's SDSC
-                # iteration space carries an extra dim and codegen indexes past
-                # its dim_labels (IndexError in parse_op_spec). Realize the
-                # merge on-device with spyre.force_copy -- a relayout copy at
-                # the merged [N*D,...] shape, NOT a host round-trip -- so the
-                # conv sees a single batch range. A size-1 N or D merges for free
-                # (degenerating to a squeeze), so the plain view suffices there.
-                #
-                # This must be spyre.force_copy (a dedicated on-device relayout
-                # copy, behaviorally identical to spyre.compact), NOT
-                # aten.clone(contiguous_format): the Spyre inductor lowering
-                # elides a contiguous-format clone of a view (treats it as a
-                # no-op and never materializes it), so the two outer ranges would
-                # survive into the folded conv2d's SDSC iteration space and
-                # parse_op_spec indexes past dim_labels (IndexError at
-                # superdsc.py). force_copy forces the on-device relayout that
-                # actually collapses N,D into a single range.
-                x_cl = torch.ops.spyre.force_copy(x_cl)
             x4 = torch.permute(x_cl, (0, 3, 1, 2))
             # weight (C_out,C_in,1,kH,kW) -> view (C_in,1,kH,kW,C_out)
             #        -> (C_in,kH,kW,C_out) -> view (C_out,C_in,kH,kW). Squeezing
@@ -3389,24 +3386,18 @@ def conv2d_via_bmm_decomp(
             w4 = torch.permute(w_cl, (3, 0, 1, 2))
         else:
             # Default row-major fold (W on the stick), the layout the im2col path
-            # accepts. Permute D next to N and merge them into the batch. These
-            # input folds stay on-device: realize each with spyre.force_copy --
-            # a relayout copy at the merged shape, NOT a device->host->device
-            # round-trip -- so the im2col+matmul decomposition sees a single
-            # batch range (mirroring the direct branch's N*D merge). Only the
-            # final output reshape needs the host round-trip (see out5 below);
-            # these inputs do not. As in the direct branch, this must be
-            # spyre.force_copy (behaviorally identical to spyre.compact) and not
-            # aten.clone(contiguous_format): the lowering elides the clone as a
-            # no-op view, leaving the fold unmaterialized (wrong im2col read);
-            # force_copy forces the on-device relayout.
+            # accepts. Permute D next to N and merge them into the batch. With
+            # N>1 AND D>1 rejected above, the N*D merge is always a squeeze view;
+            # and the im2col path's spyre.unfold already round-trips the
+            # activation through the host (CPU im2col gather), so the fold is
+            # materialised cleanly there -- no on-device relayout copy is needed
+            # on either the activation or the weight. Only the final output
+            # reshape still needs an explicit host round-trip (see out5 below).
             # activation (N,C,D,H,W) -> view (N,D,C,H,W) -> (N*D,C,H,W).
             x_dchw = torch.permute(input, (0, 2, 1, 3, 4)).contiguous()
-            x4 = torch.ops.spyre.force_copy(x_dchw.reshape(N * D, C_in, H_in, W_in))
+            x4 = x_dchw.reshape(N * D, C_in, H_in, W_in)
             # weight (C_out,C_in,1,kH,kW) -> (C_out,C_in,kH,kW).
-            w4 = torch.ops.spyre.force_copy(
-                weight.reshape(C_out, C_in_per_group, K_h, K_w)
-            )
+            w4 = weight.reshape(C_out, C_in_per_group, K_h, K_w)
 
         # Recurse into the 4D conv path; bias is added once, on the C_out dim,
         # inside the inner conv (folding D into the batch leaves C_out intact),
@@ -3443,7 +3434,7 @@ def conv2d_via_bmm_decomp(
         # of the affine form `2*d2 + d3`, which the work-division pass rejects
         # (`Unsupported: Unexpected stick expression ..., expected Mod(var, 64),
         # a bare variable, 0, ...` from _check_stick_expr_supported). Neither a
-        # pure view nor an on-device realize (spyre.force_copy) here avoids it
+        # pure view nor an on-device relayout copy here avoids it
         # -- both propagate that index, so all six wrapped
         # test_conv3d_via_conv2d_{grouped,im2col_*} LX-planning cases fail.
         # Narrowing confirmed the bad stick comes solely from this output layout,

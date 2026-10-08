@@ -6535,13 +6535,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     None,
                     (1, 1, 1),
                 ),
-                # Batch N>1 with D>1: exercises the N*D batch fold across both.
-                "2x64x3x8x8_k3": (
-                    cached_randn((2, 64, 3, 8, 8)),
-                    cached_randn((64, 64, 1, 3, 3)),
-                    None,
-                    (1, 1, 1),
-                ),
+                # NOTE: N>1 AND D>1 together (e.g. 2x64x3x8x8) is deliberately
+                # rejected as Unsupported by the fold -- see
+                # test_conv3d_via_conv2d_temporal1_gate -- so no such success
+                # case appears here. N==1 (any D) and D==1 (any N) are covered.
                 # 2x2 kernel -- smallest direct-lowered window.
                 "1x64x4x8x8_k2": (
                     cached_randn((1, 64, 4, 8, 8)),
@@ -9862,8 +9859,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         from torch_spyre._inductor.decompositions import conv2d_via_bmm_decomp
         from torch_spyre._inductor.errors import Unsupported
 
-        def _call(kD=1, stride_d=1, pad_d=0, dil_d=1, groups=1):
-            x = torch.zeros(1, 64, 2, 8, 8, dtype=torch.float16)
+        def _call(kD=1, stride_d=1, pad_d=0, dil_d=1, groups=1, N=1, D=2):
+            x = torch.zeros(N, 64, D, 8, 8, dtype=torch.float16)
             w = torch.zeros(64, 64 // groups, kD, 3, 3, dtype=torch.float16)
             return conv2d_via_bmm_decomp(
                 x,
@@ -9889,6 +9886,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     _call(pad_d=1)
                 with self.assertRaises(Unsupported):
                     _call(dil_d=2)
+                # A temporal-1 fold with BOTH batch N>1 and depth D>1 cannot
+                # express the N*D merge as a pure view, so it is rejected up
+                # front (not currently supported). N==1 (any D) and D==1 (any N)
+                # fold to a single batch range and are accepted (below).
+                with self.assertRaises(Unsupported):
+                    _call(N=2, D=3)
                 # Note: a grouped (groups != 1) temporal-1 conv3d is NO LONGER
                 # rejected here -- it folds through into conv2d_via_bmm_decomp's
                 # grouped im2col+matmul branch (see the 5D branch comment and the

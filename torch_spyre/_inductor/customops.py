@@ -534,18 +534,6 @@ def _(x: torch.Tensor) -> torch.Tensor:
     return x.new_empty(x.size())
 
 
-@torch.library.custom_op("spyre::force_copy", mutates_args=(), device_types="spyre")
-def force_copy(  # type: ignore[empty-body]
-    x: torch.Tensor,
-) -> torch.Tensor:
-    pass
-
-
-@force_copy.register_fake
-def _(x: torch.Tensor) -> torch.Tensor:
-    return x.new_empty(x.size())
-
-
 @torch.library.custom_op("spyre::max_dim_int64_fallback", mutates_args=())
 def max_dim_int64_fallback(
     input: torch.Tensor, dim: int, keepdim: bool = False

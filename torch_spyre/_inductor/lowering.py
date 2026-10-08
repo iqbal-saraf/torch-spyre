@@ -1431,33 +1431,6 @@ def lower_restickify(x):
     return pw
 
 
-@register_spyre_lowering(torch.ops.spyre.force_copy)
-def lower_force_copy(x):
-    # Behaviorally identical to lower_compact: emit a realized pointwise copy.
-    # The host output layout matches the host input; the device output is the
-    # default for that host layout; the device input layout is decided later
-    # during OpSpec generation (identity vs restickify+slice). force_copy is a
-    # distinct op from compact so a deliberate on-device relayout copy reads as
-    # such, rather than reusing the generic reduction-compaction op.
-    x.realize()
-    loader = x.make_loader()
-
-    def inner_fn(index):
-        return loader(index)
-
-    pw = Pointwise.create(
-        device=x.get_device(),
-        dtype=x.get_dtype(),
-        inner_fn=inner_fn,
-        ranges=x.get_size(),
-        origin_node=V.get_current_node(),
-        traceback=x.get_traceback(),
-    )
-
-    pw.realize()
-    return pw
-
-
 @register_spyre_lowering(torch.ops.spyre.compact)
 def lower_compact(x):
     # Just emit a pointwise op here. At this point we only know that

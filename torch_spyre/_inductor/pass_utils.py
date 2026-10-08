@@ -2371,11 +2371,9 @@ def is_sparse_stl(stl) -> bool:
 
 
 def _is_compact_node(current_node: ComputedBuffer | SchedulerNode) -> bool:
-    """Return True if current_node's FX origin is spyre::compact or
-    spyre::force_copy.
+    """Return True if current_node's FX origin is spyre::compact.
 
-    Both are on-device relayout copies (force_copy is a byte-for-byte
-    behavioral clone of compact), so neither should be classified as a
+    compact is an on-device relayout copy, so it should not be classified as a
     restickify by is_restickify_op.
     """
     try:
@@ -2388,8 +2386,7 @@ def _is_compact_node(current_node: ComputedBuffer | SchedulerNode) -> bool:
         data = buf.data
         origins: set = getattr(data, "origins", set())
         return bool(origins) and any(
-            getattr(n, "target", None)
-            in (torch.ops.spyre.compact.default, torch.ops.spyre.force_copy.default)
+            getattr(n, "target", None) == torch.ops.spyre.compact.default
             for n in origins
         )
     except Exception:
