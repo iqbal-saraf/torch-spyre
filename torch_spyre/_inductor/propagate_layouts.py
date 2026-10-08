@@ -2107,7 +2107,7 @@ def compute_layouts(
             )
         return _layernormnorm_layout(op, output, output_dep, args)
 
-    if aten_op == spyreop.compact.default:
+    if aten_op in (spyreop.compact.default, spyreop.force_copy.default):
         return _compact_layout(op, output, output_dep, args)
 
     if any(origin.target == aten.clone.default for origin in data.origins):

@@ -9600,6 +9600,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 x, weight, bias, stride=stride, padding=padding, groups=groups
             )
 
+        # Reference accumulated in fp32. A patch-embed conv (e.g. the
+        # 1x6x128_patch16_bias case) contracts over a large K (6*16*16 = 1536);
+        # CPU fp16 torch.conv2d accumulates that reduction in fp16 and loses
+        # ~150 abs of precision, while Spyre accumulates in higher precision and
+        # matches the fp32 result (verified: device vs fp32 max|d| = 0.5, 0/4096
+        # over atol). The default fp16 CPU reference would fail the correct
+        # device output against CPU's own lossy accumulation. For the small-K
+        # cases fp32 and fp16 agree, so the fp32 reference is a no-op there.
+        bias_f = bias.float() if bias is not None else None
+        ref = torch.conv2d(
+            x.float(),
+            weight.float(),
+            bias_f,
+            stride=stride,
+            padding=padding,
+            groups=groups,
+        )
+
         self.compare_with_cpu(
             fn,
             x,
@@ -9610,6 +9628,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             groups,
             atol=0.5,
             rtol=0.1,
+            dlfloat16_reference=ref,
         )
 
     def test_conv2d_direct_base(self, x, weight, bias, stride):

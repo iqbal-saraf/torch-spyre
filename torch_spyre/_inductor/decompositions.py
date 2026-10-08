@@ -3365,19 +3365,21 @@ def conv2d_via_bmm_decomp(
                 # both as separate device ranges, so the folded conv2d's SDSC
                 # iteration space carries an extra dim and codegen indexes past
                 # its dim_labels (IndexError in parse_op_spec). Realize the
-                # merge on-device with spyre.compact -- a relayout copy at the
-                # merged [N*D,...] shape, NOT a host round-trip -- so the conv
-                # sees a single batch range. A size-1 N or D merges for free
+                # merge on-device with spyre.force_copy -- a relayout copy at
+                # the merged [N*D,...] shape, NOT a host round-trip -- so the
+                # conv sees a single batch range. A size-1 N or D merges for free
                 # (degenerating to a squeeze), so the plain view suffices there.
                 #
-                # This must be spyre.compact, NOT aten.clone(contiguous_format):
-                # the Spyre inductor lowering elides a contiguous-format clone of
-                # a view (treats it as a no-op and never materializes it), so the
-                # two outer ranges survive into the folded conv2d's SDSC iteration
-                # space and parse_op_spec indexes past dim_labels (IndexError at
-                # superdsc.py). compact forces the on-device relayout that
+                # This must be spyre.force_copy (a dedicated on-device relayout
+                # copy, behaviorally identical to spyre.compact), NOT
+                # aten.clone(contiguous_format): the Spyre inductor lowering
+                # elides a contiguous-format clone of a view (treats it as a
+                # no-op and never materializes it), so the two outer ranges would
+                # survive into the folded conv2d's SDSC iteration space and
+                # parse_op_spec indexes past dim_labels (IndexError at
+                # superdsc.py). force_copy forces the on-device relayout that
                 # actually collapses N,D into a single range.
-                x_cl = torch.ops.spyre.compact(x_cl)
+                x_cl = torch.ops.spyre.force_copy(x_cl)
             x4 = torch.permute(x_cl, (0, 3, 1, 2))
             # weight (C_out,C_in,1,kH,kW) -> view (C_in,1,kH,kW,C_out)
             #        -> (C_in,kH,kW,C_out) -> view (C_out,C_in,kH,kW). Squeezing
@@ -3388,20 +3390,21 @@ def conv2d_via_bmm_decomp(
         else:
             # Default row-major fold (W on the stick), the layout the im2col path
             # accepts. Permute D next to N and merge them into the batch. These
-            # input folds stay on-device: realize each with spyre.compact -- a
-            # relayout copy at the merged shape, NOT a device->host->device round-
-            # trip -- so the im2col+matmul decomposition sees a single batch range
-            # (mirroring the direct branch's N*D merge). Only the final output
-            # reshape needs the host round-trip (see out5 below); these inputs do
-            # not. As in the direct branch, this must be spyre.compact and not
+            # input folds stay on-device: realize each with spyre.force_copy --
+            # a relayout copy at the merged shape, NOT a device->host->device
+            # round-trip -- so the im2col+matmul decomposition sees a single
+            # batch range (mirroring the direct branch's N*D merge). Only the
+            # final output reshape needs the host round-trip (see out5 below);
+            # these inputs do not. As in the direct branch, this must be
+            # spyre.force_copy (behaviorally identical to spyre.compact) and not
             # aten.clone(contiguous_format): the lowering elides the clone as a
             # no-op view, leaving the fold unmaterialized (wrong im2col read);
-            # compact forces the on-device relayout.
+            # force_copy forces the on-device relayout.
             # activation (N,C,D,H,W) -> view (N,D,C,H,W) -> (N*D,C,H,W).
             x_dchw = torch.permute(input, (0, 2, 1, 3, 4)).contiguous()
-            x4 = torch.ops.spyre.compact(x_dchw.reshape(N * D, C_in, H_in, W_in))
+            x4 = torch.ops.spyre.force_copy(x_dchw.reshape(N * D, C_in, H_in, W_in))
             # weight (C_out,C_in,1,kH,kW) -> (C_out,C_in,kH,kW).
-            w4 = torch.ops.spyre.compact(
+            w4 = torch.ops.spyre.force_copy(
                 weight.reshape(C_out, C_in_per_group, K_h, K_w)
             )
 
@@ -3440,7 +3443,7 @@ def conv2d_via_bmm_decomp(
         # of the affine form `2*d2 + d3`, which the work-division pass rejects
         # (`Unsupported: Unexpected stick expression ..., expected Mod(var, 64),
         # a bare variable, 0, ...` from _check_stick_expr_supported). Neither a
-        # pure view nor an on-device realize (spyre.compact) here avoids it
+        # pure view nor an on-device realize (spyre.force_copy) here avoids it
         # -- both propagate that index, so all six wrapped
         # test_conv3d_via_conv2d_{grouped,im2col_*} LX-planning cases fail.
         # Narrowing confirmed the bad stick comes solely from this output layout,
